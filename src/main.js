@@ -56,12 +56,17 @@ function setProgress(done, total) {
 function renderShell() {
   const app = document.getElementById('app');
   app.innerHTML = '';
-  app.appendChild(
-    el('div', { class: 'card' }, [
-      el('h1', {}, '记录链接生成器'),
-      el('p', { class: 'sub' }, [
-        '一键为多维表每一行生成「记录链接」，写回到对应行的指定列。',
+  const LINK_SVG =
+    '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg>';
+  const card = el('div', { class: 'card' }, [
+    el('div', { class: 'brand' }, [
+      el('span', { class: 'brand-mark', html: LINK_SVG }),
+      el('div', { class: 'brand-text' }, [
+        el('h1', {}, '记录链接生成器'),
+        el('p', { class: 'sub' }, '一键为多维表每一行生成「记录链接」，写回到对应列。'),
       ]),
+    ]),
+    el('div', { class: 'body' }, [
       el('div', { id: 'status', class: 'status' }, '正在初始化…'),
       el('div', { class: 'field' }, [
         el('label', {}, '数据表（选择要处理的工作表）'),
@@ -83,11 +88,7 @@ function renderShell() {
       ]),
       (domainBox = el(
         'div',
-        {
-          id: 'domainBox',
-          class: 'field domainBox',
-          style: 'display:none',
-        },
+        { id: 'domainBox', class: 'field domainBox', style: 'display:none' },
         [
           el('label', {}, '未识别到飞书域名，请填写（如 www.feishu.cn）'),
           (domainInput = el('input', {
@@ -99,14 +100,18 @@ function renderShell() {
       )),
       el('div', { class: 'actions' }, [
         (startBtn = el('button', { id: 'start', class: 'primary' }, '开始生成')),
-        (refreshBtn = el('button', { id: 'refresh' }, '刷新字段')),
+        (refreshBtn = el('button', { id: 'refresh', class: 'ghost' }, '刷新字段')),
       ]),
       el('div', { class: 'progress', id: 'progress', style: 'display:none' }, [
         el('div', { class: 'bar', id: 'bar' }, ''),
       ]),
       el('div', { class: 'log', id: 'log' }),
-    ])
-  );
+      el('div', { class: 'footer' }, [
+        '目标字段请使用「超链接」类型，生成的链接才会显示为蓝色可点击链接。',
+      ]),
+    ]),
+  ]);
+  app.appendChild(card);
   tableSel.addEventListener('change', async () => {
     if (tableSel.value) {
       await selectTable(tableSel.value);

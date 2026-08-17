@@ -113,6 +113,25 @@ function valueContainsLink(stored, link) {
 }
 
 /**
+ * 限制并发的 map：用固定大小的协程池处理 items，避免一次性并发过多触发飞书限流。
+ */
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  async function run() {
+    while (cursor < items.length) {
+      const i = cursor++;
+      results[i] = await worker(items[i], i);
+    }
+  }
+  const pool = [];
+  const n = Math.max(1, Math.min(limit, items.length));
+  for (let i = 0; i < n; i++) pool.push(run());
+  await Promise.all(pool);
+  return results;
+}
+
+/**
  * 列出当前多维表下所有数据表，用于「数据表」下拉。
  * 用 getTableMetaList() 拿名称最可靠——getTableList() 返回的 ITable 实例
  * name 经常为空，会导致下拉里只显示 tableId 而非中文表名。
@@ -180,10 +199,14 @@ export async function getAllRecords(table) {
 
 /**
  * 为每一行生成记录链接并写回目标列。
- * - targetFieldId：写回链接的列（必填，必须是「超链接」类型字段）
- * - targetFieldType：目标字段类型，用于提示
- * - sourceFieldId：可选，仅处理该列非空的行（对应“分享记录”列）
- * 写入对超链接字段做多格式兜底（{text,link} 对象 / 字符串 / 数组），确保写入成功。
+ * - targetFieldId：写回链接的列（必填，建议「超链接」类型字段）
+ * - targetFieldType：目标字段类型，仅用于提示
+ * - sourceFieldId：可选，仅处理该列非空的行
+ * 提速策略：
+ *   1) 用 setRecords 批量写（单次上限 200，这里按 100 分批），将 2N 次调用压成约 N/100 次；
+ *   2) 获取分享链接并发执行（限制并发 6，避免限流）；
+ *   3) 写后仅对首条做一次回读校验，确认格式有效，不再逐行回读。
+ * 链接格式：超链接字段写入标准结构 [{type:'url', text, link}]，飞书渲染为蓝色可点击链接。
  */
 export async function generateLinks({
   table,
@@ -207,111 +230,112 @@ export async function generateLinks({
   const isUrl = isUrlType(targetFieldType);
   if (isUrl) {
     onLog &&
-      onLog(
-        '目标为「超链接」字段，将按 URL 字段格式写入（优先纯链接字符串）。写后会回读校验确保真正写进。',
-        'info'
-      );
+      onLog('目标为「超链接」字段，将写入标准超链接结构（蓝色可点击）。', 'info');
   } else {
     onLog &&
       onLog(
-        '提示：记录链接建议写入「超链接」类型字段才会显示为可点击链接；当前按文本格式写入（纯文本，不可点击）。',
+        '提示：记录链接建议写入「超链接」类型字段才会显示蓝色可点击链接；当前按文本格式写入（纯文本，不可点击）。',
         'warn'
       );
   }
 
-  let done = 0;
-  let written = 0;
-  let skipped = 0;
-  // 已回读验证可用的取值格式：命中后优先复用，避免每行都重试多种格式
-  let verifiedFormat = null;
-  // 仅首次打印一条示例链接，便于立即确认链接格式是否规范（24 位 recordId）
-  let firstLinkLogged = false;
-
-  for (const rec of records) {
-    const recordId = rec.recordId;
-    if (!recordId) {
-      done++;
-      onProgress && onProgress(done, total);
-      continue;
-    }
+  // 1) 并发获取每条记录的分享链接（限制并发，避免触发飞书限流）
+  onLog && onLog('正在获取记录分享链接…', 'info');
+  const links = await mapWithConcurrency(records, 6, async (rec) => {
+    if (!rec.recordId) return null;
     if (
       sourceFieldId &&
       isEmptyValue(rec.fields ? rec.fields[sourceFieldId] : undefined)
-    ) {
+    )
+      return null;
+    return await getRecordLink(table, rec.recordId, domain);
+  });
+
+  // 2) 组装待写入项：超链接字段写入标准结构 [{type:'url', text, link}]（蓝色可点击）
+  const toWrite = [];
+  let skipped = 0;
+  records.forEach((rec, i) => {
+    const link = links[i];
+    if (!link) {
       skipped++;
-      done++;
-      onProgress && onProgress(done, total);
-      continue;
+      return;
     }
-    const link = await getRecordLink(table, recordId, domain);
-    if (!firstLinkLogged) {
-      firstLinkLogged = true;
-      onLog && onLog(`示例记录链接：${link}`, 'info');
-    }
+    toWrite.push({
+      recordId: rec.recordId,
+      link,
+      cellValue: [{ type: 'url', text: link, link }],
+    });
+  });
 
-    // 候选取值：
-    //  - 超链接(URL)字段：SDK 要求 IOpenUrlSegment$1[]（数组，元素 {type:'url',text,link}），
-    //    且 UrlTransformVal 允许纯字符串，故优先纯字符串。
-    //  - 文本字段：{text, link} 行内链接可点击，其次纯字符串。
-    let candidates = isUrl
-      ? [link, [{ type: 'url', text: link, link }], { type: 'url', text: link, link }]
-      : [{ text: link, link }, link, [{ text: link, link }]];
-    if (verifiedFormat) candidates = [verifiedFormat, ...candidates];
+  if (toWrite.length) {
+    onLog && onLog(`示例记录链接：${toWrite[0].link}`, 'info');
+  } else if (total > 0) {
+    onLog &&
+      onLog('没有需要写入的行（源字段筛选后为空，或记录无有效 id）。', 'warn');
+  }
 
-    let ok = false;
-    let lastErr = null;
-    let lastResolvedValue = null; // 最后一个“setCellValue 未抛错”的取值
-    const triedKeys = new Set();
-    for (const v of candidates) {
-      const key = JSON.stringify(v);
-      if (triedKeys.has(key)) continue;
-      triedKeys.add(key);
-      try {
-        await table.setCellValue(targetFieldId, recordId, v);
-        lastResolvedValue = v;
-        // 写后回读校验：避免 SDK 静默“成功”却没存进可见值（之前的假成功根因）
-        const { available, value } = await readCell(table, targetFieldId, recordId);
-        if (!available) {
-          // 回读不可用：无法校验，信任 setCellValue 已提交
-          ok = true;
-          verifiedFormat = v;
-          break;
+  // 3) 批量写入
+  let written = 0;
+  if (toWrite.length) {
+    if (typeof table.setRecords === 'function') {
+      const BATCH = 100; // setRecords 单次上限 200，取 100 留余量
+      for (let i = 0; i < toWrite.length; i += BATCH) {
+        const batch = toWrite.slice(i, i + BATCH);
+        const payload = batch.map((w) => ({
+          recordId: w.recordId,
+          fields: { [targetFieldId]: w.cellValue },
+        }));
+        let okCount = 0;
+        try {
+          await table.setRecords(payload);
+          okCount = batch.length;
+        } catch (e) {
+          // 批量失败：退化为逐行写入，逐行定位失败
+          for (const w of batch) {
+            try {
+              await table.setCellValue(targetFieldId, w.recordId, w.cellValue);
+              okCount++;
+            } catch (e2) {
+              onLog &&
+                onLog(
+                  `写入行 ${w.recordId} 失败：${e2 && e2.message ? e2.message : e2}`,
+                  'error'
+                );
+            }
+          }
         }
-        if (valueContainsLink(value, link)) {
-          ok = true;
-          verifiedFormat = v;
-          break;
+        written += okCount;
+        onProgress && onProgress(skipped + i + batch.length, total);
+      }
+    } else {
+      for (const w of toWrite) {
+        try {
+          await table.setCellValue(targetFieldId, w.recordId, w.cellValue);
+          written++;
+        } catch (e) {
+          onLog &&
+            onLog(
+              `写入行 ${w.recordId} 失败：${e && e.message ? e.message : e}`,
+              'error'
+            );
         }
-        // 回读可用但为空/不含链接，继续尝试下一种格式
-      } catch (e) {
-        lastErr = e;
+        onProgress && onProgress(skipped + written, total);
       }
     }
+  }
 
-    // 所有格式都“写入未抛错”但回读均未含链接：可能是回读缓存延迟，信任最后一次写入
-    if (!ok && !lastErr && lastResolvedValue != null) {
-      ok = true;
-      verifiedFormat = lastResolvedValue;
+  // 4) 仅对首条做一次回读校验，确认格式真正写进（避免“假成功”又不拖慢整体）
+  if (toWrite.length && written > 0) {
+    const first = toWrite[0];
+    const { available, value } = await readCell(table, targetFieldId, first.recordId);
+    if (available && value != null && !valueContainsLink(value, first.link)) {
       onLog &&
         onLog(
-          `行 ${recordId}：写入已提交，但回读校验未确认（可能为缓存延迟），请在表中确认是否出现链接。`,
+          '警告：回读校验未确认链接写入，请确认目标字段类型是否为「超链接」。',
           'warn'
         );
     }
-
-    if (ok) {
-      written++;
-    } else if (lastErr) {
-      onLog && onLog(`写入行 ${recordId} 失败：${lastErr.message || lastErr}`, 'error');
-    } else {
-      onLog &&
-        onLog(
-          `写入行 ${recordId} 失败：所有格式回读均无内容（目标列可能不是可写字段，或字段类型不匹配）。`,
-          'error'
-        );
-    }
-    done++;
-    onProgress && onProgress(done, total);
   }
+
   return { total, written, skipped };
 }
