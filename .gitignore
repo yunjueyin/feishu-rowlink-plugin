@@ -3,3 +3,7 @@ dist
 .out
 .DS_Store
 *.local
+
+# 构建产物
+.deploy/
+.out/
