@@ -1,23 +1,14 @@
 import { bitable } from '@lark-base-open/js-sdk';
 
 /**
- * 从插件 iframe 的 referrer（即飞书多维表页面地址）中解析 appToken 与域名。
- * 飞书多维表 URL 形如 https://www.feishu.cn/base/{appToken}?table=...&view=...
- * 在自定义组件 iframe 内，document.referrer 即为该页面地址。
+ * 从插件 iframe 的 referrer（即飞书多维表页面地址）中解析飞书域名。
+ * 飞书「记录链接」的标准格式为 https://<domain>/record/<recordId>，域名取当前页面域名即可。
  */
-export function parseBaseFromReferrer() {
+export function parseDomainFromReferrer() {
   try {
     const ref = document.referrer || '';
-    const m = ref.match(/\/base\/([^/?#]+)/);
-    if (m) {
-      let domain = 'www.feishu.cn';
-      try {
-        domain = new URL(ref).host;
-      } catch (e) {
-        /* 忽略，使用默认域名 */
-      }
-      return { appToken: m[1], domain };
-    }
+    const m = ref.match(/^https?:\/\/([^/?#]+)/);
+    if (m) return m[1];
   } catch (e) {
     /* 忽略 */
   }
@@ -25,35 +16,24 @@ export function parseBaseFromReferrer() {
 }
 
 /**
- * 解析用户手动填写的内容：完整多维表链接，或裸 appToken。
+ * 从用户手动输入中提取飞书域名（支持完整链接或裸域名如 www.feishu.cn）。
  */
-export function parseRawBase(raw) {
+export function parseRawDomain(raw) {
   if (!raw) return null;
-  try {
-    const m = raw.match(/\/base\/([^/?#]+)/);
-    if (m) {
-      let domain = 'www.feishu.cn';
-      try {
-        domain = new URL(raw).host;
-      } catch (e) {
-        /* 忽略 */
-      }
-      return { appToken: m[1], domain };
-    }
-  } catch (e) {
-    /* 忽略 */
-  }
-  if (/^[a-zA-Z0-9]+$/.test(raw.trim())) {
-    return { appToken: raw.trim(), domain: 'www.feishu.cn' };
-  }
+  const m = raw.match(
+    /([a-zA-Z0-9-]+\.feishu\.(cn|com)|[a-zA-Z0-9-]+\.larksuite\.com)/
+  );
+  if (m) return m[1];
   return null;
 }
 
-/** 拼出一条记录在飞书多维表里可被直接打开的链接 */
-export function buildRecordLink(domain, appToken, tableId, recordId) {
-  return `https://${domain}/base/${appToken}?table=${encodeURIComponent(
-    tableId
-  )}&record=${encodeURIComponent(recordId)}`;
+/**
+ * 生成一条记录在飞书的「记录链接」。
+ * 这是飞书「复制记录链接」功能导出的标准格式，仅依赖 recordId，
+ * 不依赖 appToken / tableId，因此绝不会退化成「整个表格的链接」。
+ */
+export function buildRecordLink(domain, recordId) {
+  return `https://${domain}/record/${recordId}`;
 }
 
 /** 判断单元格值是否为空（字符串/数组/null 等） */
@@ -64,39 +44,60 @@ export function isEmptyValue(v) {
   return false;
 }
 
-/** 获取当前激活的数据表及其字段元信息 */
-export async function getActiveTableMeta() {
-  const table = await bitable.base.getActiveTable();
-  const fieldMetas = await table.getFieldMetaList();
-  return { table, fieldMetas };
+/** 列出当前多维表下所有数据表，用于「数据表」下拉 */
+export async function listTables() {
+  const tables = await bitable.base.getTableList();
+  return (tables || []).map((t) => ({ id: t.id, name: t.name || t.id }));
 }
 
-/** 分页读取当前表全部记录，兼容 getRecordsByPage / getRecordIdList 两种 API */
+/** 获取某个数据表的字段元信息 */
+export async function getTableFields(table) {
+  return await table.getFieldMetaList();
+}
+
+/** 将不同 API 返回结构统一为 { recordId, fields } */
+function normalizeRecord(r) {
+  if (!r) return { recordId: null, fields: {} };
+  const recordId = r.recordId != null ? r.recordId : r.id;
+  return { recordId, fields: r.fields || {} };
+}
+
+/**
+ * 读取数据表全部记录，兼容 getRecordsByPage / getRecordIdList 两种 API。
+ * 优先使用 getRecordIdList（recordId 一定准确），再回退到分页读取。
+ */
 export async function getAllRecords(table) {
+  const records = [];
+  if (typeof table.getRecordIdList === 'function') {
+    const ids = await table.getRecordIdList();
+    for (const id of ids) {
+      let r = null;
+      try {
+        r = await table.getRecordById(id);
+      } catch (e) {
+        r = { recordId: id, fields: {} };
+      }
+      records.push(normalizeRecord(r));
+    }
+    return records;
+  }
   if (typeof table.getRecordsByPage === 'function') {
-    const records = [];
     let pageToken;
     do {
       const res = await table.getRecordsByPage({ pageSize: 200, pageToken });
       const list = (res && res.records) || [];
-      records.push(...list);
+      for (const r of list) records.push(normalizeRecord(r));
       if (!res || !res.hasMore) break;
       pageToken = res.pageToken;
     } while (pageToken);
     return records;
   }
-  const ids = await table.getRecordIdList();
-  const recs = [];
-  for (const id of ids) {
-    const r = await table.getRecordById(id);
-    recs.push({ recordId: id, fields: (r && r.fields) || {} });
-  }
-  return recs;
+  return records;
 }
 
 /**
  * 为每一行生成记录链接并写回目标列。
- * - targetFieldId：写回链接的列（必填）
+ * - targetFieldId：写回链接的列（必填，建议用「文本」类型）
  * - sourceFieldId：可选，仅处理该列非空的行（对应“分享记录”列）
  * 按行串行写入，避免并发写入触发飞书限流。
  */
@@ -105,7 +106,6 @@ export async function generateLinks({
   targetFieldId,
   sourceFieldId,
   domain,
-  appToken,
   onProgress,
   onLog,
 }) {
@@ -114,9 +114,6 @@ export async function generateLinks({
   let done = 0;
   let written = 0;
   let skipped = 0;
-
-  const tableId =
-    table.id || (table.getTableMeta && (await table.getTableMeta()).id);
 
   for (const rec of records) {
     const recordId = rec.recordId;
@@ -134,7 +131,7 @@ export async function generateLinks({
       onProgress && onProgress(done, total);
       continue;
     }
-    const link = buildRecordLink(domain, appToken, tableId, recordId);
+    const link = buildRecordLink(domain, recordId);
     try {
       await table.setCellValue(targetFieldId, recordId, link);
       written++;

@@ -1,19 +1,20 @@
 import './style.css';
 import { bitable } from '@lark-base-open/js-sdk';
 import {
-  parseBaseFromReferrer,
-  parseRawBase,
-  getActiveTableMeta,
+  parseDomainFromReferrer,
+  parseRawDomain,
+  listTables,
+  getTableFields,
   generateLinks,
 } from './widget.js';
 
 // 模块级元素引用（DOM 只构建一次）
-let targetSel, sourceSel, appTokenBox, appTokenInput, startBtn, refreshBtn;
+let tableSel, targetSel, sourceSel, domainBox, domainInput, startBtn, refreshBtn;
 let state = {
+  domain: 'www.feishu.cn',
+  tables: [],
   table: null,
   fieldMetas: [],
-  appToken: null,
-  domain: 'www.feishu.cn',
   ready: false,
 };
 
@@ -63,6 +64,12 @@ function renderShell() {
       ]),
       el('div', { id: 'status', class: 'status' }, '正在初始化…'),
       el('div', { class: 'field' }, [
+        el('label', {}, '数据表（选择要处理的工作表）'),
+        (tableSel = el('select', { id: 'tableField' }, [
+          el('option', { value: '' }, '正在加载数据表…'),
+        ])),
+      ]),
+      el('div', { class: 'field' }, [
         el('label', {}, '目标字段（写回记录链接的列）'),
         (targetSel = el('select', { id: 'targetField' }, [
           el('option', { value: '' }, '请选择字段…'),
@@ -74,18 +81,22 @@ function renderShell() {
           el('option', { value: '' }, '（处理全部行）'),
         ])),
       ]),
-      (appTokenBox = el('div', {
-        id: 'appTokenBox',
-        class: 'field appTokenBox',
-        style: 'display:none',
-      }, [
-        el('label', {}, '未自动识别到多维表地址，请手动粘贴多维表链接或 appToken'),
-        (appTokenInput = el('input', {
-          id: 'appTokenInput',
-          type: 'text',
-          placeholder: 'https://www.feishu.cn/base/xxxx 或 bascn...',
-        })),
-      ])),
+      (domainBox = el(
+        'div',
+        {
+          id: 'domainBox',
+          class: 'field domainBox',
+          style: 'display:none',
+        },
+        [
+          el('label', {}, '未识别到飞书域名，请填写（如 www.feishu.cn）'),
+          (domainInput = el('input', {
+            id: 'domainInput',
+            type: 'text',
+            placeholder: 'www.feishu.cn',
+          })),
+        ]
+      )),
       el('div', { class: 'actions' }, [
         (startBtn = el('button', { id: 'start', class: 'primary' }, '开始生成')),
         (refreshBtn = el('button', { id: 'refresh' }, '刷新字段')),
@@ -96,6 +107,11 @@ function renderShell() {
       el('div', { class: 'log', id: 'log' }),
     ])
   );
+  tableSel.addEventListener('change', async () => {
+    if (tableSel.value) {
+      await selectTable(tableSel.value);
+    }
+  });
   startBtn.addEventListener('click', onStart);
   refreshBtn.addEventListener('click', () => init(true));
 }
@@ -105,43 +121,55 @@ function fillFieldOptions() {
   sourceSel.innerHTML = '';
   targetSel.appendChild(el('option', { value: '' }, '请选择字段…'));
   sourceSel.appendChild(el('option', { value: '' }, '（处理全部行）'));
-  let preselect = '';
   state.fieldMetas.forEach((f) => {
     targetSel.appendChild(el('option', { value: f.id }, f.name));
     sourceSel.appendChild(el('option', { value: f.id }, f.name));
-    if (!preselect && /记录链接|链接|link/i.test(f.name)) preselect = f.id;
   });
-  if (preselect) targetSel.value = preselect;
+}
+
+async function selectTable(tableId) {
+  const table = await bitable.base.getTable(tableId);
+  state.table = table;
+  const metas = await getTableFields(table);
+  state.fieldMetas = metas;
+  fillFieldOptions();
+  document.getElementById('status').textContent =
+    `当前数据表：${table.name || table.id} ｜ 字段数：${metas.length}`;
 }
 
 async function init(refresh = false) {
-  const detected = parseBaseFromReferrer();
-  if (detected) {
-    state.appToken = detected.appToken;
-    state.domain = detected.domain;
-    appTokenBox.style.display = 'none';
-    log(
-      `已自动识别多维表：${detected.appToken}（${detected.domain}）`,
-      'ok'
-    );
+  // 1) 解析飞书域名
+  const detected = parseDomainFromReferrer();
+  if (detected && /feishu|larksuite/.test(detected)) {
+    state.domain = detected;
+    domainBox.style.display = 'none';
+    log(`已识别飞书域名：${detected}`, 'ok');
   } else {
-    appTokenBox.style.display = 'block';
-    log('未能自动识别多维表地址，请在上方手动填写。', 'warn');
+    domainBox.style.display = 'block';
+    log('未能识别飞书域名，请在上方手动填写（如 www.feishu.cn）。', 'warn');
   }
 
+  // 2) 列出数据表并默认选中当前激活表
   try {
-    const { table, fieldMetas } = await getActiveTableMeta();
-    state.table = table;
-    state.fieldMetas = fieldMetas;
-    fillFieldOptions();
-    const tableName = table.name || table.id || '（当前数据表）';
-    document.getElementById('status').textContent =
-      `当前数据表：${tableName} ｜ 字段数：${fieldMetas.length}`;
-    state.ready = true;
-    log(
-      `已加载字段：${fieldMetas.map((f) => f.name).join('、') || '（无）'}`,
-      'ok'
+    const tables = await listTables();
+    state.tables = tables;
+    tableSel.innerHTML = '';
+    if (!tables.length) {
+      tableSel.appendChild(el('option', { value: '' }, '（无可用数据表）'));
+    }
+    tables.forEach((t) =>
+      tableSel.appendChild(el('option', { value: t.id }, t.name))
     );
+
+    const active = await bitable.base.getActiveTable();
+    if (active && tables.find((t) => t.id === active.id)) {
+      tableSel.value = active.id;
+      await selectTable(active.id);
+    } else if (tables.length) {
+      await selectTable(tables[0].id);
+    }
+    log(`已加载数据表：${tables.map((t) => t.name).join('、') || '（无）'}`, 'ok');
+    state.ready = true;
   } catch (e) {
     document.getElementById('status').textContent = '初始化失败';
     log(
@@ -163,17 +191,15 @@ async function onStart() {
     return;
   }
 
-  let appToken = state.appToken;
   let domain = state.domain;
-  if (!appToken) {
-    const raw = (appTokenInput.value || '').trim();
-    const parsed = parseRawBase(raw);
+  if (!/feishu|larksuite/.test(domain || '')) {
+    const raw = (domainInput.value || '').trim();
+    const parsed = parseRawDomain(raw);
     if (!parsed) {
-      log('请填写有效的多维表链接或 appToken。', 'warn');
+      log('请填写有效的飞书域名。', 'warn');
       return;
     }
-    appToken = parsed.appToken;
-    domain = parsed.domain;
+    domain = parsed;
   }
 
   const sourceFieldId = sourceSel.value || null;
@@ -188,7 +214,6 @@ async function onStart() {
       targetFieldId,
       sourceFieldId,
       domain,
-      appToken,
       onProgress: setProgress,
       onLog: log,
     });
