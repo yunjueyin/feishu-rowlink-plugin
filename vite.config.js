@@ -6,6 +6,7 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     assetsDir: 'assets',
-    emptyOutDir: true,
+    // 关闭自动清空：本环境的安全删除包装会拦截 fs.rmSync(dist)，导致构建失败
+    emptyOutDir: false,
   },
 });

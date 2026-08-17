@@ -44,8 +44,32 @@ export function isEmptyValue(v) {
   return false;
 }
 
-/** 列出当前多维表下所有数据表，用于「数据表」下拉 */
+/**
+ * 判断字段是否为「链接 / URL」类型。
+ * 不同 SDK 版本下 type 可能是数字（15）或字符串（'url'/'link'/'hyperlink'），全部兼容。
+ */
+function isUrlType(t) {
+  if (t == null) return false;
+  const s = String(t).toLowerCase();
+  return t === 15 || s === 'url' || s === 'link' || s === 'hyperlink';
+}
+
+/**
+ * 列出当前多维表下所有数据表，用于「数据表」下拉。
+ * 用 getTableMetaList() 拿名称最可靠——getTableList() 返回的 ITable 实例
+ * name 经常为空，会导致下拉里只显示 tableId 而非中文表名。
+ */
 export async function listTables() {
+  let metas = [];
+  try {
+    metas = await bitable.base.getTableMetaList();
+  } catch (e) {
+    metas = [];
+  }
+  if (metas && metas.length) {
+    return metas.map((m) => ({ id: m.id, name: m.name || m.id }));
+  }
+  // 兜底：仍尝试 getTableList
   const tables = await bitable.base.getTableList();
   return (tables || []).map((t) => ({ id: t.id, name: t.name || t.id }));
 }
@@ -86,7 +110,7 @@ export async function getAllRecords(table) {
     do {
       const res = await table.getRecordsByPage({ pageSize: 200, pageToken });
       const list = (res && res.records) || [];
-      for (const r of list) records.push(normalizeRecord(r));
+      for (const rec of list) records.push(normalizeRecord(rec));
       if (!res || !res.hasMore) break;
       pageToken = res.pageToken;
     } while (pageToken);
@@ -97,13 +121,15 @@ export async function getAllRecords(table) {
 
 /**
  * 为每一行生成记录链接并写回目标列。
- * - targetFieldId：写回链接的列（必填，建议用「文本」类型）
+ * - targetFieldId：写回链接的列（必填）
+ * - targetFieldType：目标字段类型，链接类型需用 { text, link } 结构写入，否则写纯字符串
  * - sourceFieldId：可选，仅处理该列非空的行（对应“分享记录”列）
- * 按行串行写入，避免并发写入触发飞书限流。
+ * 写入做了「链接 / 文本」两种格式互为兜底，最大限度兼容字段类型。
  */
 export async function generateLinks({
   table,
   targetFieldId,
+  targetFieldType,
   sourceFieldId,
   domain,
   onProgress,
@@ -114,6 +140,7 @@ export async function generateLinks({
   let done = 0;
   let written = 0;
   let skipped = 0;
+  const isUrl = isUrlType(targetFieldType);
 
   for (const rec of records) {
     const recordId = rec.recordId;
@@ -132,15 +159,23 @@ export async function generateLinks({
       continue;
     }
     const link = buildRecordLink(domain, recordId);
+    // 链接字段需要 { text, link } 结构；文本字段直接用字符串。两种互为兜底。
+    const primary = isUrl ? { text: link, link } : link;
+    const fallback = isUrl ? link : { text: link, link };
     try {
-      await table.setCellValue(targetFieldId, recordId, link);
+      await table.setCellValue(targetFieldId, recordId, primary);
       written++;
     } catch (e) {
-      onLog &&
-        onLog(
-          `写入行 ${recordId} 失败：${e && e.message ? e.message : e}`,
-          'error'
-        );
+      try {
+        await table.setCellValue(targetFieldId, recordId, fallback);
+        written++;
+      } catch (e2) {
+        onLog &&
+          onLog(
+            `写入行 ${recordId} 失败：${e2 && e2.message ? e2.message : e2}`,
+            'error'
+          );
+      }
     }
     done++;
     onProgress && onProgress(done, total);

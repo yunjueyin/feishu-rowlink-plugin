@@ -70,7 +70,7 @@ function renderShell() {
         ])),
       ]),
       el('div', { class: 'field' }, [
-        el('label', {}, '目标字段（写回记录链接的列）'),
+        el('label', {}, '目标字段（写回记录链接的列，建议用「文本」类型）'),
         (targetSel = el('select', { id: 'targetField' }, [
           el('option', { value: '' }, '请选择字段…'),
         ])),
@@ -133,8 +133,9 @@ async function selectTable(tableId) {
   const metas = await getTableFields(table);
   state.fieldMetas = metas;
   fillFieldOptions();
+  const info = state.tables.find((t) => t.id === tableId);
   document.getElementById('status').textContent =
-    `当前数据表：${table.name || table.id} ｜ 字段数：${metas.length}`;
+    `当前数据表：${info ? info.name : table.name || table.id} ｜ 字段数：${metas.length}`;
 }
 
 async function init(refresh = false) {
@@ -209,9 +210,11 @@ async function onStart() {
   log('开始生成记录链接…', 'info');
 
   try {
+    const targetMeta = state.fieldMetas.find((f) => f.id === targetFieldId);
     const res = await generateLinks({
       table: state.table,
       targetFieldId,
+      targetFieldType: targetMeta ? targetMeta.type : null,
       sourceFieldId,
       domain,
       onProgress: setProgress,
