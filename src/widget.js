@@ -210,20 +210,30 @@ export async function getAllRecords(table) {
  */
 export async function generateLinks({
   table,
+  records,
   targetFieldId,
   targetFieldType,
   sourceFieldId,
   domain,
+  selectedIds,
   onProgress,
   onLog,
 }) {
-  const records = await getAllRecords(table);
-  const total = records.length;
-  onLog && onLog(`已读取 ${total} 条记录，目标字段类型：${targetFieldType}。`, 'info');
+  // 按选中范围过滤：selectedIds 提供且非空时只处理选中的记录
+  const selSet = selectedIds && selectedIds.length ? new Set(selectedIds) : null;
+  const work = selSet ? records.filter((r) => selSet.has(r.recordId)) : records;
+  const total = work.length;
+  onLog &&
+    onLog(
+      `已就绪 ${total} 条记录（共 ${records.length} 条），目标字段类型：${targetFieldType}。`,
+      'info'
+    );
   if (total === 0) {
     onLog &&
       onLog(
-        '未读取到任何记录：请确认组件已添加到「包含数据」的多维表，且当前选中的数据表确实有记录。',
+        selSet
+          ? '没有勾选任何记录，请在记录列表中勾选要转换的行。'
+          : '未读取到任何记录：请确认组件已添加到「包含数据」的多维表，且当前选中的数据表确实有记录。',
         'warn'
       );
   }
@@ -241,7 +251,7 @@ export async function generateLinks({
 
   // 1) 并发获取每条记录的分享链接（限制并发，避免触发飞书限流）
   onLog && onLog('正在获取记录分享链接…', 'info');
-  const links = await mapWithConcurrency(records, 6, async (rec) => {
+  const links = await mapWithConcurrency(work, 6, async (rec) => {
     if (!rec.recordId) return null;
     if (
       sourceFieldId &&
@@ -254,7 +264,7 @@ export async function generateLinks({
   // 2) 组装待写入项：超链接字段写入标准结构 [{type:'url', text, link}]（蓝色可点击）
   const toWrite = [];
   let skipped = 0;
-  records.forEach((rec, i) => {
+  work.forEach((rec, i) => {
     const link = links[i];
     if (!link) {
       skipped++;
@@ -338,4 +348,25 @@ export async function generateLinks({
   }
 
   return { total, written, skipped };
+}
+
+/**
+ * 取一条记录用于列表展示的预览文本：优先第一个有内容的字段值，否则回退 recordId。
+ */
+export function previewText(record, fieldMetas) {
+  const f = (record && record.fields) || {};
+  for (const meta of fieldMetas || []) {
+    const v = f[meta.id];
+    if (v == null) continue;
+    if (typeof v === 'string') {
+      const t = v.trim();
+      if (t) return t;
+    } else if (Array.isArray(v) && v.length) {
+      const first = v[0];
+      if (first && (first.text || first.name || first.link || first.title)) {
+        return String(first.text || first.name || first.link || first.title);
+      }
+    }
+  }
+  return record && record.recordId ? String(record.recordId) : '(空行)';
 }
