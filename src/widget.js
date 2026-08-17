@@ -112,6 +112,25 @@ function valueContainsLink(stored, link) {
   return String(stored).includes(link);
 }
 
+/** 判断单元格取值是否已是一条记录链接（含 /record/），用于增量跳过时识别“已生成”行 */
+function valueLooksLikeRecordLink(stored) {
+  if (stored == null) return false;
+  if (typeof stored === 'string') return stored.includes('/record/');
+  if (Array.isArray(stored))
+    return stored.some(
+      (s) =>
+        s &&
+        ((s.link && s.link.includes('/record/')) ||
+          (s.text && s.text.includes('/record/')))
+    );
+  if (typeof stored === 'object')
+    return (
+      (stored.link && stored.link.includes('/record/')) ||
+      (stored.text && stored.text.includes('/record/'))
+    );
+  return String(stored).includes('/record/');
+}
+
 /**
  * 限制并发的 map：用固定大小的协程池处理 items，避免一次性并发过多触发飞书限流。
  */
@@ -216,6 +235,8 @@ export async function generateLinks({
   sourceFieldId,
   domain,
   selectedIds,
+  skipExisting = true,
+  linkText = null,
   onProgress,
   onLog,
 }) {
@@ -249,7 +270,18 @@ export async function generateLinks({
       );
   }
 
-  // 1) 并发获取每条记录的分享链接（限制并发，避免触发飞书限流）
+  // 0) 预读目标列已有值（增量跳过）：识别哪些行已经生成过记录链接
+  const existing = new Map();
+  if (skipExisting && total > 0) {
+    onLog && onLog('正在检查已有链接（增量跳过已生成行）…', 'info');
+    await mapWithConcurrency(work, 6, async (rec) => {
+      if (!rec.recordId) return;
+      const { available, value } = await readCell(table, targetFieldId, rec.recordId);
+      existing.set(rec.recordId, !!(available && valueLooksLikeRecordLink(value)));
+    });
+  }
+
+  // 1) 并发获取每条记录的分享链接（已存在的行直接跳过，限制并发避免限流）
   onLog && onLog('正在获取记录分享链接…', 'info');
   const links = await mapWithConcurrency(work, 6, async (rec) => {
     if (!rec.recordId) return null;
@@ -258,22 +290,26 @@ export async function generateLinks({
       isEmptyValue(rec.fields ? rec.fields[sourceFieldId] : undefined)
     )
       return null;
+    if (skipExisting && existing.get(rec.recordId)) return null;
     return await getRecordLink(table, rec.recordId, domain);
   });
 
   // 2) 组装待写入项：超链接字段写入标准结构 [{type:'url', text, link}]（蓝色可点击）
   const toWrite = [];
-  let skipped = 0;
+  let skipped = 0; // 源字段空 / 无有效 id
+  let skippedExisting = 0; // 已存在记录链接，跳过
   work.forEach((rec, i) => {
     const link = links[i];
     if (!link) {
-      skipped++;
+      if (skipExisting && existing.get(rec.recordId)) skippedExisting++;
+      else skipped++;
       return;
     }
+    const display = linkText && linkText.trim() ? linkText.trim() : link;
     toWrite.push({
       recordId: rec.recordId,
       link,
-      cellValue: [{ type: 'url', text: link, link }],
+      cellValue: [{ type: 'url', text: display, link }],
     });
   });
 
@@ -284,8 +320,9 @@ export async function generateLinks({
       onLog('没有需要写入的行（源字段筛选后为空，或记录无有效 id）。', 'warn');
   }
 
-  // 3) 批量写入
+  // 3) 批量写入（setRecords 批量，失败退化为逐行，逐行收集失败明细）
   let written = 0;
+  const failedRows = [];
   if (toWrite.length) {
     if (typeof table.setRecords === 'function') {
       const BATCH = 100; // setRecords 单次上限 200，取 100 留余量
@@ -295,27 +332,29 @@ export async function generateLinks({
           recordId: w.recordId,
           fields: { [targetFieldId]: w.cellValue },
         }));
-        let okCount = 0;
+        const okIds = new Set();
         try {
           await table.setRecords(payload);
-          okCount = batch.length;
+          batch.forEach((w) => okIds.add(w.recordId));
         } catch (e) {
-          // 批量失败：退化为逐行写入，逐行定位失败
           for (const w of batch) {
             try {
               await table.setCellValue(targetFieldId, w.recordId, w.cellValue);
-              okCount++;
+              okIds.add(w.recordId);
             } catch (e2) {
-              onLog &&
-                onLog(
-                  `写入行 ${w.recordId} 失败：${e2 && e2.message ? e2.message : e2}`,
-                  'error'
-                );
+              failedRows.push({
+                recordId: w.recordId,
+                error: e2 && e2.message ? e2.message : String(e2),
+              });
             }
           }
         }
-        written += okCount;
-        onProgress && onProgress(skipped + i + batch.length, total);
+        written += okIds.size;
+        onProgress &&
+          onProgress(
+            Math.min(total, skipped + skippedExisting + i + batch.length),
+            total
+          );
       }
     } else {
       for (const w of toWrite) {
@@ -323,13 +362,16 @@ export async function generateLinks({
           await table.setCellValue(targetFieldId, w.recordId, w.cellValue);
           written++;
         } catch (e) {
-          onLog &&
-            onLog(
-              `写入行 ${w.recordId} 失败：${e && e.message ? e.message : e}`,
-              'error'
-            );
+          failedRows.push({
+            recordId: w.recordId,
+            error: e && e.message ? e.message : String(e),
+          });
         }
-        onProgress && onProgress(skipped + written, total);
+        onProgress &&
+          onProgress(
+            Math.min(total, skipped + skippedExisting + written),
+            total
+          );
       }
     }
   }
@@ -347,7 +389,19 @@ export async function generateLinks({
     }
   }
 
-  return { total, written, skipped };
+  const failedSet = new Set(failedRows.map((f) => f.recordId));
+  const linksOut = toWrite
+    .filter((w) => !failedSet.has(w.recordId))
+    .map((w) => ({ recordId: w.recordId, link: w.link }));
+  return {
+    total,
+    written,
+    skipped,
+    skippedExisting,
+    failed: failedRows.length,
+    failedRows,
+    links: linksOut,
+  };
 }
 
 /**
