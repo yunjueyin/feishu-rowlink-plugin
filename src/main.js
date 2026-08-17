@@ -57,7 +57,7 @@ function renderShell() {
   const app = document.getElementById('app');
   app.innerHTML = '';
   const LINK_SVG =
-    '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg>';
+    '<svg viewBox="0 0 24 24" width="22" height="22"><rect x="2" y="2" width="20" height="20" rx="6" fill="#ffffff"/><g fill="none" stroke="#3370ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></g></svg>';
   const card = el('div', { class: 'card' }, [
     el('div', { class: 'brand' }, [
       el('span', { class: 'brand-mark', html: LINK_SVG }),
