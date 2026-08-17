@@ -30,6 +30,7 @@ let state = {
 };
 
 const CFG_KEY = 'feishu_rowlink_cfg_v1';
+const CFG_VERSION = 1; // 配置结构版本，schema 变更时 +1 使旧配置失效
 
 function el(tag, props = {}, children = []) {
   const node = document.createElement(tag);
@@ -364,11 +365,19 @@ function fillFieldOptions() {
 
 function applyCfgToControls(cfg) {
   if (!cfg) return;
-  if (cfg.targetFieldId) targetSel.value = cfg.targetFieldId;
-  if (cfg.sourceFieldId) sourceSel.value = cfg.sourceFieldId;
-  if (cfg.previewFieldId != null) {
+  const metaIds = new Set(state.fieldMetas.map((f) => f.id));
+  const has = (id) => id && metaIds.has(id);
+  if (cfg.targetFieldId && has(cfg.targetFieldId)) targetSel.value = cfg.targetFieldId;
+  else if (cfg.targetFieldId)
+    log('已保存的目标字段不存在（可能已改名/删除），已忽略。', 'warn');
+  if (cfg.sourceFieldId && has(cfg.sourceFieldId)) sourceSel.value = cfg.sourceFieldId;
+  else if (cfg.sourceFieldId)
+    log('已保存的源字段不存在（可能已改名/删除），已忽略。', 'warn');
+  if (cfg.previewFieldId != null && has(cfg.previewFieldId)) {
     previewSel.value = cfg.previewFieldId;
     state.previewFieldId = cfg.previewFieldId;
+  } else if (cfg.previewFieldId != null) {
+    log('已保存的预览字段不存在（可能已改名/删除），已忽略。', 'warn');
   }
   if (cfg.mode) setMode(cfg.mode);
   if (typeof cfg.skipExisting === 'boolean') {
@@ -380,7 +389,9 @@ function applyCfgToControls(cfg) {
 function loadCfg() {
   try {
     const raw = localStorage.getItem(CFG_KEY);
-    return raw ? JSON.parse(raw) : null;
+    const obj = raw ? JSON.parse(raw) : null;
+    if (!obj || obj.version !== CFG_VERSION) return null; // 版本不符（或旧无版本）直接忽略
+    return obj;
   } catch (e) {
     return null;
   }
@@ -389,6 +400,7 @@ function loadCfg() {
 function saveCfg() {
   try {
     const cfg = {
+      version: CFG_VERSION,
       tableId: state.tableId,
       targetFieldId: targetSel.value,
       sourceFieldId: sourceSel.value,
@@ -528,7 +540,8 @@ async function onStart(opts = {}) {
 
   const sourceFieldId = sourceSel.value || null;
   let selectedIds = null;
-  if (state.mode === 'selected') {
+  // 正常“仅选中行”模式：必须勾选了记录（重跑失败项走下方 onlyIds 分支，不在此校验）
+  if (state.mode === 'selected' && !opts.onlyIds) {
     selectedIds = Array.from(state.selected);
     if (!selectedIds.length) {
       log('请在记录列表中勾选要转换的行。', 'warn');
@@ -536,9 +549,15 @@ async function onStart(opts = {}) {
     }
   }
 
-  // 若为“重跑失败项”，从 opts 取失败的 id 集合
+  // 若为“重跑失败项”，从 opts 取失败的 id 集合；先校验这些 id 仍存在于当前表
   if (opts.onlyIds) {
-    selectedIds = opts.onlyIds;
+    const valid = new Set(state.records.map((r) => r.recordId));
+    const filtered = (opts.onlyIds || []).filter((id) => valid.has(id));
+    if (!filtered.length) {
+      log('没有可重跑的记录（这些记录可能已不在当前数据表）。', 'warn');
+      return;
+    }
+    selectedIds = filtered;
     if (state.mode !== 'selected') setMode('selected');
   }
 

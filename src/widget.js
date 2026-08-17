@@ -45,7 +45,10 @@ export function buildRecordLink(domain, recordId) {
 async function getRecordLink(table, recordId, domain) {
   try {
     if (typeof table.getRecordShareLink === 'function') {
-      const share = await table.getRecordShareLink(recordId);
+      const share = await withRetry(() => table.getRecordShareLink(recordId), {
+        retries: 3,
+        baseDelay: 300,
+      });
       if (share && typeof share === 'string' && share.trim()) {
         return share.trim();
       }
@@ -82,7 +85,10 @@ function isUrlType(t) {
 async function readCell(table, fieldId, recordId) {
   try {
     if (typeof table.getCellValue === 'function') {
-      const v = await table.getCellValue(fieldId, recordId);
+      const v = await withRetry(
+        () => table.getCellValue(fieldId, recordId),
+        { retries: 2, baseDelay: 200 }
+      );
       return { available: true, value: v };
     }
   } catch (e) {
@@ -134,13 +140,16 @@ function valueLooksLikeRecordLink(stored) {
 /**
  * 限制并发的 map：用固定大小的协程池处理 items，避免一次性并发过多触发飞书限流。
  */
-async function mapWithConcurrency(items, limit, worker) {
+async function mapWithConcurrency(items, limit, worker, onItem) {
   const results = new Array(items.length);
   let cursor = 0;
+  let done = 0;
   async function run() {
     while (cursor < items.length) {
       const i = cursor++;
       results[i] = await worker(items[i], i);
+      done++;
+      if (onItem) onItem(done, items.length);
     }
   }
   const pool = [];
@@ -148,6 +157,25 @@ async function mapWithConcurrency(items, limit, worker) {
   for (let i = 0; i < n; i++) pool.push(run());
   await Promise.all(pool);
   return results;
+}
+
+/**
+ * 带退避重试的调用包装：应对飞书接口偶发限流 / 网络抖动。
+ * 失败时按指数退避重试，最多 retries 次；全部失败后抛出最后一个错误。
+ */
+async function withRetry(fn, { retries = 3, baseDelay = 300, onRetry } = {}) {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await fn();
+    } catch (e) {
+      attempt++;
+      if (attempt > retries) throw e;
+      const delay = baseDelay * Math.pow(2, attempt - 1);
+      if (onRetry) onRetry(attempt, e);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
 }
 
 /**
@@ -283,16 +311,21 @@ export async function generateLinks({
 
   // 1) 并发获取每条记录的分享链接（已存在的行直接跳过，限制并发避免限流）
   onLog && onLog('正在获取记录分享链接…', 'info');
-  const links = await mapWithConcurrency(work, 6, async (rec) => {
-    if (!rec.recordId) return null;
-    if (
-      sourceFieldId &&
-      isEmptyValue(rec.fields ? rec.fields[sourceFieldId] : undefined)
-    )
-      return null;
-    if (skipExisting && existing.get(rec.recordId)) return null;
-    return await getRecordLink(table, rec.recordId, domain);
-  });
+  const links = await mapWithConcurrency(
+    work,
+    6,
+    async (rec) => {
+      if (!rec.recordId) return null;
+      if (
+        sourceFieldId &&
+        isEmptyValue(rec.fields ? rec.fields[sourceFieldId] : undefined)
+      )
+        return null;
+      if (skipExisting && existing.get(rec.recordId)) return null;
+      return await getRecordLink(table, rec.recordId, domain);
+    },
+    (done, n) => onProgress && onProgress(done, n)
+  );
 
   // 2) 组装待写入项：超链接字段写入标准结构 [{type:'url', text, link}]（蓝色可点击）
   const toWrite = [];
@@ -320,10 +353,15 @@ export async function generateLinks({
       onLog('没有需要写入的行（源字段筛选后为空，或记录无有效 id）。', 'warn');
   }
 
-  // 3) 批量写入（setRecords 批量，失败退化为逐行，逐行收集失败明细）
+  // 3) 批量写入（setRecords 批量；用返回值精确判定成功行，缺失/失败行逐行兜底重试）
   let written = 0;
   const failedRows = [];
   if (toWrite.length) {
+    const markFail = (w, e) =>
+      failedRows.push({
+        recordId: w.recordId,
+        error: e && e.message ? e.message : String(e),
+      });
     if (typeof table.setRecords === 'function') {
       const BATCH = 100; // setRecords 单次上限 200，取 100 留余量
       for (let i = 0; i < toWrite.length; i += BATCH) {
@@ -333,19 +371,41 @@ export async function generateLinks({
           fields: { [targetFieldId]: w.cellValue },
         }));
         const okIds = new Set();
+        const writeOne = (w) =>
+          withRetry(
+            () => table.setCellValue(targetFieldId, w.recordId, w.cellValue),
+            { retries: 2, baseDelay: 200 }
+          );
         try {
-          await table.setRecords(payload);
-          batch.forEach((w) => okIds.add(w.recordId));
+          const res = await withRetry(() => table.setRecords(payload), {
+            retries: 3,
+            baseDelay: 300,
+          });
+          // SDK 成功时返回已写入的 recordId 数组；据此精确判定哪些真正写入
+          const okSet = new Set(
+            Array.isArray(res) ? res : batch.map((w) => w.recordId)
+          );
+          for (const w of batch) {
+            if (okSet.has(w.recordId)) {
+              okIds.add(w.recordId);
+            } else {
+              // 批量返回中缺失 -> 该条未写入，逐行兜底重试一次
+              try {
+                await writeOne(w);
+                okIds.add(w.recordId);
+              } catch (e2) {
+                markFail(w, e2);
+              }
+            }
+          }
         } catch (e) {
+          // 整批失败 -> 逐行兜底（带重试）
           for (const w of batch) {
             try {
-              await table.setCellValue(targetFieldId, w.recordId, w.cellValue);
+              await writeOne(w);
               okIds.add(w.recordId);
             } catch (e2) {
-              failedRows.push({
-                recordId: w.recordId,
-                error: e2 && e2.message ? e2.message : String(e2),
-              });
+              markFail(w, e2);
             }
           }
         }
@@ -359,13 +419,13 @@ export async function generateLinks({
     } else {
       for (const w of toWrite) {
         try {
-          await table.setCellValue(targetFieldId, w.recordId, w.cellValue);
+          await withRetry(
+            () => table.setCellValue(targetFieldId, w.recordId, w.cellValue),
+            { retries: 2, baseDelay: 200 }
+          );
           written++;
         } catch (e) {
-          failedRows.push({
-            recordId: w.recordId,
-            error: e && e.message ? e.message : String(e),
-          });
+          markFail(w, e);
         }
         onProgress &&
           onProgress(
@@ -376,14 +436,23 @@ export async function generateLinks({
     }
   }
 
-  // 4) 仅对首条做一次回读校验，确认格式真正写进（避免“假成功”又不拖慢整体）
+  // 4) 抽样回读校验：首条 + 间隔取样（最多 5 条），覆盖更广又能避免过度拖慢
   if (toWrite.length && written > 0) {
-    const first = toWrite[0];
-    const { available, value } = await readCell(table, targetFieldId, first.recordId);
-    if (available && value != null && !valueContainsLink(value, first.link)) {
+    const n = toWrite.length;
+    const want = Math.min(5, n);
+    const idxs = new Set();
+    for (let s = 0; s < want; s++) idxs.add(Math.floor((s * n) / want));
+    let bad = 0;
+    for (const k of idxs) {
+      const w = toWrite[k];
+      if (!w) continue;
+      const { available, value } = await readCell(table, targetFieldId, w.recordId);
+      if (!available || value == null || !valueContainsLink(value, w.link)) bad++;
+    }
+    if (bad > 0) {
       onLog &&
         onLog(
-          '警告：回读校验未确认链接写入，请确认目标字段类型是否为「超链接」。',
+          `警告：抽样回读有 ${bad} 条未确认链接写入，请确认目标字段类型是否为「超链接」。`,
           'warn'
         );
     }
