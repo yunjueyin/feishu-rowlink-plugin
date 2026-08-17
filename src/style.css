@@ -167,6 +167,10 @@ body {
   gap: 12px;
 }
 
+.row2 > * {
+  min-width: 0;
+}
+
 select,
 input[type='text'] {
   width: 100%;
@@ -260,6 +264,8 @@ input[type='text']:focus {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
   padding: 10px 12px;
   background: var(--log-bg);
   border-bottom: 1px solid var(--border);
@@ -273,6 +279,7 @@ input[type='text']:focus {
 
 .rec-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
 }
 
@@ -322,6 +329,7 @@ input[type='text']:focus {
   cursor: pointer;
   transition: background 0.12s;
   background: var(--row-bg);
+  min-width: 0;
 }
 
 .rec-item:hover {
@@ -697,4 +705,47 @@ button:disabled {
 [data-theme='dark'] .rec-list::-webkit-scrollbar-thumb,
 [data-theme='dark'] .log::-webkit-scrollbar-thumb {
   background: #4a4f59;
+}
+
+/* 窄屏（飞书部分组件区域 / 移动端）响应式兜底：避免并排元素挤压错位 */
+@media (max-width: 430px) {
+  .body {
+    padding: 16px 14px 18px;
+  }
+  .row2 {
+    grid-template-columns: 1fr;
+  }
+  .rec-head {
+    padding: 8px 10px;
+  }
+  .rec-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+  .actions {
+    flex-wrap: wrap;
+  }
+  .actions button {
+    flex: 1 1 auto;
+    min-width: 120px;
+  }
+  .modal-actions {
+    flex-wrap: wrap;
+  }
+  .modal-actions button {
+    flex: 1 1 auto;
+  }
+  .rc-actions {
+    gap: 6px;
+  }
+  .rc-actions .link-btn {
+    flex: 1 1 auto;
+    text-align: center;
+  }
+  .brand-text h1 {
+    font-size: 16px;
+  }
+  .brand-text .sub {
+    font-size: 11.5px;
+  }
 }
