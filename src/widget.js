@@ -45,7 +45,7 @@ export function isEmptyValue(v) {
 }
 
 /**
- * 判断字段是否为「链接 / URL」类型。
+ * 判断字段是否为「超链接 / URL」类型。
  * 不同 SDK 版本下 type 可能是数字（15）或字符串（'url'/'link'/'hyperlink'），全部兼容。
  */
 function isUrlType(t) {
@@ -69,7 +69,6 @@ export async function listTables() {
   if (metas && metas.length) {
     return metas.map((m) => ({ id: m.id, name: m.name || m.id }));
   }
-  // 兜底：仍尝试 getTableList
   const tables = await bitable.base.getTableList();
   return (tables || []).map((t) => ({ id: t.id, name: t.name || t.id }));
 }
@@ -87,11 +86,24 @@ function normalizeRecord(r) {
 }
 
 /**
- * 读取数据表全部记录，兼容 getRecordsByPage / getRecordIdList 两种 API。
- * 优先使用 getRecordIdList（recordId 一定准确），再回退到分页读取。
+ * 读取数据表全部记录。
+ * 优先使用 getRecordsByPage：在飞书自定义组件(widget)环境实测可用且能正确返回 recordId；
+ * getRecordIdList 在该环境可能返回空，故作为兜底。
  */
 export async function getAllRecords(table) {
   const records = [];
+  if (typeof table.getRecordsByPage === 'function') {
+    let pageToken;
+    let guard = 0;
+    do {
+      const res = await table.getRecordsByPage({ pageSize: 200, pageToken });
+      const list = (res && res.records) || [];
+      for (const rec of list) records.push(normalizeRecord(rec));
+      if (!res || !res.hasMore) break;
+      pageToken = res.pageToken;
+    } while (pageToken && guard++ < 1000);
+    return records;
+  }
   if (typeof table.getRecordIdList === 'function') {
     const ids = await table.getRecordIdList();
     for (const id of ids) {
@@ -105,26 +117,15 @@ export async function getAllRecords(table) {
     }
     return records;
   }
-  if (typeof table.getRecordsByPage === 'function') {
-    let pageToken;
-    do {
-      const res = await table.getRecordsByPage({ pageSize: 200, pageToken });
-      const list = (res && res.records) || [];
-      for (const rec of list) records.push(normalizeRecord(rec));
-      if (!res || !res.hasMore) break;
-      pageToken = res.pageToken;
-    } while (pageToken);
-    return records;
-  }
   return records;
 }
 
 /**
  * 为每一行生成记录链接并写回目标列。
- * - targetFieldId：写回链接的列（必填）
- * - targetFieldType：目标字段类型，链接类型需用 { text, link } 结构写入，否则写纯字符串
+ * - targetFieldId：写回链接的列（必填，必须是「超链接」类型字段）
+ * - targetFieldType：目标字段类型，用于提示
  * - sourceFieldId：可选，仅处理该列非空的行（对应“分享记录”列）
- * 写入做了「链接 / 文本」两种格式互为兜底，最大限度兼容字段类型。
+ * 写入对超链接字段做多格式兜底（{text,link} 对象 / 字符串 / 数组），确保写入成功。
  */
 export async function generateLinks({
   table,
@@ -137,10 +138,22 @@ export async function generateLinks({
 }) {
   const records = await getAllRecords(table);
   const total = records.length;
+  onLog && onLog(`已读取 ${total} 条记录，目标字段类型：${targetFieldType}。`, 'info');
+  if (total === 0) {
+    onLog &&
+      onLog(
+        '未读取到任何记录：请确认组件已添加到「包含数据」的多维表，且当前选中的数据表确实有记录。',
+        'warn'
+      );
+  }
+  if (!isUrlType(targetFieldType)) {
+    onLog &&
+      onLog('提示：记录链接应写入「超链接」类型字段，才会显示为可点击链接。', 'warn');
+  }
+
   let done = 0;
   let written = 0;
   let skipped = 0;
-  const isUrl = isUrlType(targetFieldType);
 
   for (const rec of records) {
     const recordId = rec.recordId;
@@ -159,23 +172,22 @@ export async function generateLinks({
       continue;
     }
     const link = buildRecordLink(domain, recordId);
-    // 链接字段需要 { text, link } 结构；文本字段直接用字符串。两种互为兜底。
-    const primary = isUrl ? { text: link, link } : link;
-    const fallback = isUrl ? link : { text: link, link };
-    try {
-      await table.setCellValue(targetFieldId, recordId, primary);
-      written++;
-    } catch (e) {
+    // 超链接字段写入格式不确定，依次尝试多种，命中即止
+    const candidates = [{ text: link, link }, link, [{ text: link, link }]];
+    let ok = false;
+    for (const v of candidates) {
       try {
-        await table.setCellValue(targetFieldId, recordId, fallback);
-        written++;
-      } catch (e2) {
-        onLog &&
-          onLog(
-            `写入行 ${recordId} 失败：${e2 && e2.message ? e2.message : e2}`,
-            'error'
-          );
+        await table.setCellValue(targetFieldId, recordId, v);
+        ok = true;
+        break;
+      } catch (e) {
+        /* 尝试下一种格式 */
       }
+    }
+    if (ok) {
+      written++;
+    } else {
+      onLog && onLog(`写入行 ${recordId} 失败（所有格式均失败）。`, 'error');
     }
     done++;
     onProgress && onProgress(done, total);

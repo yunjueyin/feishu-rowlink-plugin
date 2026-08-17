@@ -70,7 +70,7 @@ function renderShell() {
         ])),
       ]),
       el('div', { class: 'field' }, [
-        el('label', {}, '目标字段（写回记录链接的列，建议用「文本」类型）'),
+        el('label', {}, '目标字段（写回记录链接的列，必须用「超链接」类型）'),
         (targetSel = el('select', { id: 'targetField' }, [
           el('option', { value: '' }, '请选择字段…'),
         ])),
