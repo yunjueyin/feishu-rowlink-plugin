@@ -55,6 +55,44 @@ function isUrlType(t) {
 }
 
 /**
+ * 读取单元格当前值（写后回读校验用）。
+ * 返回 { available, value }：available=false 表示 getCellValue 不可用/抛错，
+ * 此时无法校验，应信任 setCellValue 的提交结果，避免误判失败。
+ */
+async function readCell(table, fieldId, recordId) {
+  try {
+    if (typeof table.getCellValue === 'function') {
+      const v = await table.getCellValue(fieldId, recordId);
+      return { available: true, value: v };
+    }
+  } catch (e) {
+    /* 回读失败不应中断写入流程 */
+  }
+  return { available: false, value: undefined };
+}
+
+/** 判断已写入的单元格取值里是否包含目标链接（兼容数组 / 对象 / 字符串多种形态） */
+function valueContainsLink(stored, link) {
+  if (stored == null) return false;
+  if (typeof stored === 'string') return stored.includes(link);
+  if (Array.isArray(stored)) {
+    return stored.some(
+      (s) =>
+        s &&
+        ((s.link && String(s.link).includes(link)) ||
+          (s.text && String(s.text).includes(link)))
+    );
+  }
+  if (typeof stored === 'object') {
+    return (
+      (stored.link && String(stored.link).includes(link)) ||
+      (stored.text && String(stored.text).includes(link))
+    );
+  }
+  return String(stored).includes(link);
+}
+
+/**
  * 列出当前多维表下所有数据表，用于「数据表」下拉。
  * 用 getTableMetaList() 拿名称最可靠——getTableList() 返回的 ITable 实例
  * name 经常为空，会导致下拉里只显示 tableId 而非中文表名。
@@ -146,14 +184,26 @@ export async function generateLinks({
         'warn'
       );
   }
-  if (!isUrlType(targetFieldType)) {
+  const isUrl = isUrlType(targetFieldType);
+  if (isUrl) {
     onLog &&
-      onLog('提示：记录链接应写入「超链接」类型字段，才会显示为可点击链接。', 'warn');
+      onLog(
+        '目标为「超链接」字段，将按 URL 字段格式写入（优先纯链接字符串）。写后会回读校验确保真正写进。',
+        'info'
+      );
+  } else {
+    onLog &&
+      onLog(
+        '提示：记录链接建议写入「超链接」类型字段才会显示为可点击链接；当前按文本格式写入（纯文本，不可点击）。',
+        'warn'
+      );
   }
 
   let done = 0;
   let written = 0;
   let skipped = 0;
+  // 已回读验证可用的取值格式：命中后优先复用，避免每行都重试多种格式
+  let verifiedFormat = null;
 
   for (const rec of records) {
     const recordId = rec.recordId;
@@ -172,22 +222,67 @@ export async function generateLinks({
       continue;
     }
     const link = buildRecordLink(domain, recordId);
-    // 超链接字段写入格式不确定，依次尝试多种，命中即止
-    const candidates = [{ text: link, link }, link, [{ text: link, link }]];
+
+    // 候选取值：
+    //  - 超链接(URL)字段：SDK 要求 IOpenUrlSegment$1[]（数组，元素 {type:'url',text,link}），
+    //    且 UrlTransformVal 允许纯字符串，故优先纯字符串。
+    //  - 文本字段：{text, link} 行内链接可点击，其次纯字符串。
+    let candidates = isUrl
+      ? [link, [{ type: 'url', text: link, link }], { type: 'url', text: link, link }]
+      : [{ text: link, link }, link, [{ text: link, link }]];
+    if (verifiedFormat) candidates = [verifiedFormat, ...candidates];
+
     let ok = false;
+    let lastErr = null;
+    let lastResolvedValue = null; // 最后一个“setCellValue 未抛错”的取值
+    const triedKeys = new Set();
     for (const v of candidates) {
+      const key = JSON.stringify(v);
+      if (triedKeys.has(key)) continue;
+      triedKeys.add(key);
       try {
         await table.setCellValue(targetFieldId, recordId, v);
-        ok = true;
-        break;
+        lastResolvedValue = v;
+        // 写后回读校验：避免 SDK 静默“成功”却没存进可见值（之前的假成功根因）
+        const { available, value } = await readCell(table, targetFieldId, recordId);
+        if (!available) {
+          // 回读不可用：无法校验，信任 setCellValue 已提交
+          ok = true;
+          verifiedFormat = v;
+          break;
+        }
+        if (valueContainsLink(value, link)) {
+          ok = true;
+          verifiedFormat = v;
+          break;
+        }
+        // 回读可用但为空/不含链接，继续尝试下一种格式
       } catch (e) {
-        /* 尝试下一种格式 */
+        lastErr = e;
       }
     }
+
+    // 所有格式都“写入未抛错”但回读均未含链接：可能是回读缓存延迟，信任最后一次写入
+    if (!ok && !lastErr && lastResolvedValue != null) {
+      ok = true;
+      verifiedFormat = lastResolvedValue;
+      onLog &&
+        onLog(
+          `行 ${recordId}：写入已提交，但回读校验未确认（可能为缓存延迟），请在表中确认是否出现链接。`,
+          'warn'
+        );
+    }
+
     if (ok) {
       written++;
+    } else if (lastErr) {
+      onLog && onLog(`写入行 ${recordId} 失败：${lastErr.message || lastErr}`, 'error');
     } else {
-      onLog && onLog(`写入行 ${recordId} 失败（所有格式均失败）。`, 'error');
+      onLog &&
+        onLog(
+          `写入行 ${recordId} 失败：所有格式回读均无内容（目标列可能不是可写字段，或字段类型不匹配）。`,
+          'error'
+        );
     }
     done++;
     onProgress && onProgress(done, total);
