@@ -36,6 +36,26 @@ export function buildRecordLink(domain, recordId) {
   return `https://${domain}/record/${recordId}`;
 }
 
+/**
+ * 获取某条记录的可分享链接。
+ * 优先用飞书官方的 getRecordShareLink（返回含 24 位规范 recordId 的链接）；
+ * 因为 getRecordsByPage 返回的 recordId 只是客户端临时 id，直接拼 /record/<id>
+ * 会跳到“页面不存在”。仅在 getRecordShareLink 不可用/失败时回退到自行拼接。
+ */
+async function getRecordLink(table, recordId, domain) {
+  try {
+    if (typeof table.getRecordShareLink === 'function') {
+      const share = await table.getRecordShareLink(recordId);
+      if (share && typeof share === 'string' && share.trim()) {
+        return share.trim();
+      }
+    }
+  } catch (e) {
+    /* 回退到自行拼接 domain/record/id */
+  }
+  return buildRecordLink(domain, recordId);
+}
+
 /** 判断单元格值是否为空（字符串/数组/null 等） */
 export function isEmptyValue(v) {
   if (v == null) return true;
@@ -204,6 +224,8 @@ export async function generateLinks({
   let skipped = 0;
   // 已回读验证可用的取值格式：命中后优先复用，避免每行都重试多种格式
   let verifiedFormat = null;
+  // 仅首次打印一条示例链接，便于立即确认链接格式是否规范（24 位 recordId）
+  let firstLinkLogged = false;
 
   for (const rec of records) {
     const recordId = rec.recordId;
@@ -221,7 +243,11 @@ export async function generateLinks({
       onProgress && onProgress(done, total);
       continue;
     }
-    const link = buildRecordLink(domain, recordId);
+    const link = await getRecordLink(table, recordId, domain);
+    if (!firstLinkLogged) {
+      firstLinkLogged = true;
+      onLog && onLog(`示例记录链接：${link}`, 'info');
+    }
 
     // 候选取值：
     //  - 超链接(URL)字段：SDK 要求 IOpenUrlSegment$1[]（数组，元素 {type:'url',text,link}），
