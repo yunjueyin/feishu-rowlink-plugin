@@ -144,20 +144,23 @@ function renderShell() {
       ]),
       el('div', { class: 'row2' }, [
         el('div', { class: 'field' }, [
-          el('label', {}, '目标字段（须为「超链接」类型）'),
+          el('label', {}, '写入链接的列'),
+          el('span', { class: 'hint' }, '记录链接会写进这一列（建议选「超链接」类型，才能蓝色可点击）'),
           (targetSel = el('select', { id: 'targetField' }, [
             el('option', { value: '' }, '请选择字段…'),
           ])),
         ]),
         el('div', { class: 'field' }, [
-          el('label', {}, '源字段（可选）'),
+          el('label', {}, '筛选列（可选）'),
+          el('span', { class: 'hint' }, '只给这一列有内容的行生成；不选则全部行都生成'),
           (sourceSel = el('select', { id: 'sourceField' }, [
             el('option', { value: '' }, '（全部行）'),
           ])),
         ]),
       ]),
       el('div', { class: 'field' }, [
-        el('label', {}, '预览字段（列表行显示内容）'),
+        el('label', {}, '列表显示列'),
+        el('span', { class: 'hint' }, '记录列表里每行用哪一列的内容来显示'),
         (previewSel = el('select', { id: 'previewField' }, [
           el('option', { value: '' }, '自动：首个有内容字段'),
         ])),
@@ -220,7 +223,7 @@ function renderShell() {
       el('div', { class: 'log', id: 'log' }),
       (resultCard = el('div', { id: 'resultCard', class: 'result-card', style: 'display:none' })),
       el('div', { class: 'footer' }, [
-        '目标字段用「超链接」类型，链接才会显示为蓝色可点击。',
+        '写入链接的列用「超链接」类型，链接才会显示为蓝色可点击。',
       ]),
     ]),
   ]);
@@ -369,15 +372,15 @@ function applyCfgToControls(cfg) {
   const has = (id) => id && metaIds.has(id);
   if (cfg.targetFieldId && has(cfg.targetFieldId)) targetSel.value = cfg.targetFieldId;
   else if (cfg.targetFieldId)
-    log('已保存的目标字段不存在（可能已改名/删除），已忽略。', 'warn');
+    log('已保存的「写入链接的列」不存在（可能已改名/删除），已忽略。', 'warn');
   if (cfg.sourceFieldId && has(cfg.sourceFieldId)) sourceSel.value = cfg.sourceFieldId;
   else if (cfg.sourceFieldId)
-    log('已保存的源字段不存在（可能已改名/删除），已忽略。', 'warn');
+    log('已保存的「筛选列」不存在（可能已改名/删除），已忽略。', 'warn');
   if (cfg.previewFieldId != null && has(cfg.previewFieldId)) {
     previewSel.value = cfg.previewFieldId;
     state.previewFieldId = cfg.previewFieldId;
   } else if (cfg.previewFieldId != null) {
-    log('已保存的预览字段不存在（可能已改名/删除），已忽略。', 'warn');
+    log('已保存的「列表显示列」不存在（可能已改名/删除），已忽略。', 'warn');
   }
   if (cfg.mode) setMode(cfg.mode);
   if (typeof cfg.skipExisting === 'boolean') {
@@ -524,7 +527,7 @@ async function onStart(opts = {}) {
   }
   const targetFieldId = targetSel.value;
   if (!targetFieldId) {
-    log('请选择「目标字段」。', 'warn');
+    log('请选择「写入链接的列」。', 'warn');
     return;
   }
 
@@ -610,7 +613,7 @@ async function onStart(opts = {}) {
   }
   const infoHtml = `
     <div class="cf-row"><span>转换范围</span><b>${modeText}</b></div>
-    <div class="cf-row"><span>目标字段</span><b>${escapeHtml(targetName)}</b></div>
+    <div class="cf-row"><span>写入列</span><b>${escapeHtml(targetName)}</b></div>
     <div class="cf-row"><span>将影响行数</span><b>${affectCount} 行</b></div>
     <div class="cf-row"><span>跳过已生成</span><b>${state.skipExisting && !opts.forceWrite ? '是' : '否'}</b></div>
     <div class="cf-tip">点击「确认生成」后，将把记录链接写入上述字段列。</div>`;

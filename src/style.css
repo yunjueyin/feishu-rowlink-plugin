@@ -161,6 +161,15 @@ body {
   color: var(--text-sub);
 }
 
+.field .hint {
+  display: block;
+  margin: -2px 0 8px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-sub);
+  opacity: 0.85;
+}
+
 .row2 {
   display: grid;
   grid-template-columns: 1fr 1fr;

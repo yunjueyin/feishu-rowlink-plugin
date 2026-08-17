@@ -274,7 +274,7 @@ export async function generateLinks({
   const total = work.length;
   onLog &&
     onLog(
-      `已就绪 ${total} 条记录（共 ${records.length} 条），目标字段类型：${targetFieldType}。`,
+      `已就绪 ${total} 条记录（共 ${records.length} 条），写入列类型：${targetFieldType}。`,
       'info'
     );
   if (total === 0) {
@@ -350,7 +350,7 @@ export async function generateLinks({
     onLog && onLog(`示例记录链接：${toWrite[0].link}`, 'info');
   } else if (total > 0) {
     onLog &&
-      onLog('没有需要写入的行（源字段筛选后为空，或记录无有效 id）。', 'warn');
+      onLog('没有需要写入的行（筛选列筛选后为空，或记录无有效 id）。', 'warn');
   }
 
   // 3) 批量写入（setRecords 批量；用返回值精确判定成功行，缺失/失败行逐行兜底重试）
@@ -452,7 +452,7 @@ export async function generateLinks({
     if (bad > 0) {
       onLog &&
         onLog(
-          `警告：抽样回读有 ${bad} 条未确认链接写入，请确认目标字段类型是否为「超链接」。`,
+          `警告：抽样回读有 ${bad} 条未确认链接写入，请确认写入列类型是否为「超链接」。`,
           'warn'
         );
     }
